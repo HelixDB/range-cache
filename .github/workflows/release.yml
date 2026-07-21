@@ -22,6 +22,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           if curl --fail --silent --show-error \
+            --user-agent "range-cache-release/${version}" \
             "https://crates.io/api/v1/crates/range-cache/${version}" \
             >/dev/null; then
             echo "range-cache ${version} is already published"
