@@ -1,0 +1,18 @@
+range-cache
+Copyright 2026 HelixDB, Inc.
+
+This crate generalizes work originally developed in HelixDB/helix-proper:
+
+* crates/db/src/search/text/byte_range_cache.rs
+* crates/db/src/search/text/storage_with_cache.rs
+* crates/db/src/search/text/debounced_storage.rs
+
+The original implementations entered the repository in commit
+4bda346919d9ceac630afc242008b7e1d0831a04. Subsequent work incorporated here
+was authored by xav-db <xav@helix-db.com> and Matthew Sanetra
+<41018997+matthewsanetra@users.noreply.github.com> in commits c2eec7a, 29342ba,
+0446f9d, 9ea7eba, a1ce909, 423cbf1, 96405bd, bef2376, and 8bd222b.
+
+The source repository is https://github.com/HelixDB/helix-proper and the full
+original attribution remains available in its Git history.
+
