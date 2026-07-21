@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published crate version to verify or release
+        required: true
 
 permissions:
   contents: read
@@ -20,7 +25,8 @@ jobs:
       - name: Publish crate if needed
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${{ inputs.version || github.ref_name }}"
+          version="${version#v}"
           if curl --fail --silent --show-error \
             --user-agent "range-cache-release/${version}" \
             "https://crates.io/api/v1/crates/range-cache/${version}" \
