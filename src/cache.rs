@@ -165,10 +165,11 @@ impl<K: Ord + Clone> State<K> {
         };
 
         let mut covered = Vec::new();
-        if let Some((&start, block)) = ranges.range(..=requested.start).next_back()
-            && block.end > requested.start
-        {
-            covered.push((start, requested.start..block.end.min(requested.end)));
+        match ranges.range(..=requested.start).next_back() {
+            Some((&start, block)) if block.end > requested.start => {
+                covered.push((start, requested.start..block.end.min(requested.end)));
+            }
+            Some(_) | None => {}
         }
 
         covered.extend(
@@ -351,11 +352,12 @@ impl<K: Ord + Clone> RangeCache<K> {
         }
 
         let merged_length = merged_end - merged_start;
-        if let CacheCapacity::Bounded(capacity) = self.capacity
-            && merged_length > capacity.get()
-        {
-            state.statistics.admissions_rejected_too_large += 1;
-            return Ok(InsertOutcome::TooLarge);
+        match self.capacity {
+            CacheCapacity::Bounded(capacity) if merged_length > capacity.get() => {
+                state.statistics.admissions_rejected_too_large += 1;
+                return Ok(InsertOutcome::TooLarge);
+            }
+            CacheCapacity::Bounded(_) | CacheCapacity::Unbounded => {}
         }
 
         let merged_bytes =

@@ -1,7 +1,4 @@
-//! A thread-safe sparse byte-range cache.
-//!
-//! The core cache has no async runtime dependency. Enable the `async` feature
-//! for a read-through wrapper over arbitrary immutable range sources.
+#![doc = include_str!("../README.md")]
 
 mod cache;
 mod error;
