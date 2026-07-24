@@ -92,19 +92,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         convert::Infallible,
         num::NonZeroUsize,
         ops::Range,
-        sync::{Arc, Mutex},
+        sync::Arc,
     };
 
     use bytes::Bytes;
     use range_cache::{CacheCapacity, CachedReader, RangeCache, RangeReader, ReaderConfig};
 
-    struct ObjectStore {
-        data: Bytes,
-        fetched: Mutex<Vec<Range<usize>>>,
-    }
+    struct MemorySource(Bytes);
 
     #[async_trait::async_trait]
-    impl RangeReader<String> for ObjectStore {
+    impl RangeReader<String> for MemorySource {
         type Error = Infallible;
 
         async fn read_range(
@@ -112,41 +109,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _key: &String,
             range: Range<usize>,
         ) -> Result<Bytes, Self::Error> {
-            self.fetched
-                .lock()
-                .expect("fetch log lock is not poisoned")
-                .push(range.clone());
-            Ok(self.data.slice(range))
+            Ok(self.0.slice(range))
         }
     }
 
-    let source = Arc::new(ObjectStore {
-        data: Bytes::from_static(b"abcdefghijklmnop"),
-        fetched: Mutex::new(Vec::new()),
-    });
+    let cache = RangeCache::new(CacheCapacity::Bounded(
+        NonZeroUsize::new(1024).expect("capacity is non-zero"),
+    ));
+    let source = Arc::new(MemorySource(Bytes::from_static(b"abcdefghijklmnop")));
     let reader = CachedReader::new(
-        Arc::clone(&source),
-        RangeCache::new(CacheCapacity::Bounded(
-            NonZeroUsize::new(1024).expect("capacity is non-zero"),
-        )),
+        source,
+        cache,
         ReaderConfig::new(NonZeroUsize::new(4).expect("concurrency is non-zero")),
     );
     let key = String::from("s3://bucket/index");
 
     assert_eq!(
-        reader.read(&key, 0..8).await?,
-        Bytes::from_static(b"abcdefgh"),
-    );
-    assert_eq!(
         reader.read(&key, 4..12).await?,
         Bytes::from_static(b"efghijkl"),
-    );
-    assert_eq!(
-        *source
-            .fetched
-            .lock()
-            .expect("fetch log lock is not poisoned"),
-        vec![0..8, 8..12],
     );
     Ok(())
 }

@@ -91,8 +91,7 @@ impl<K: Ord> Default for InFlightRegistry<K> {
 }
 
 struct InFlightEntry {
-    gate: AsyncMutex<()>,
-    successful_response: Mutex<Option<Bytes>>,
+    response: AsyncMutex<Option<Bytes>>,
 }
 
 impl<K: Ord + Clone> InFlightRegistry<K> {
@@ -102,8 +101,7 @@ impl<K: Ord + Clone> InFlightRegistry<K> {
             let current = entries.get(&request).and_then(Weak::upgrade);
             let entry = current.unwrap_or_else(|| {
                 Arc::new(InFlightEntry {
-                    gate: AsyncMutex::new(()),
-                    successful_response: Mutex::new(None),
+                    response: AsyncMutex::new(None),
                 })
             });
             entries.insert(request.clone(), Arc::downgrade(&entry));
@@ -209,10 +207,23 @@ where
     /// Panics only if the privately owned fetch semaphore is unexpectedly
     /// closed or an internal read-plan coverage invariant is violated.
     pub async fn read(&self, key: &K, range: Range<usize>) -> Result<Bytes, ReadError<R::Error>> {
-        let (mut cached, missing) = match self.cache.read_plan(key, range.clone())? {
+        let (mut cached, mut missing) = match self.cache.read_plan(key, range.clone())? {
             ReadPlan::Complete(bytes) => return Ok(bytes),
             ReadPlan::Fetch { cached, missing } => (cached, missing),
         };
+
+        if missing.len() == 1 {
+            let gap = missing.pop().expect("one missing gap exists");
+            let fetched = self.fetch_gap(key, gap).await?;
+            if cached.is_empty() && fetched.0 == range {
+                return Ok(fetched.1);
+            }
+
+            let position =
+                cached.partition_point(|(chunk_range, _)| chunk_range.start < fetched.0.start);
+            cached.insert(position, fetched);
+            return Ok(reconstruct(range, cached));
+        }
 
         let fetched = stream::iter(missing)
             .map(|gap| self.fetch_gap(key, gap))
@@ -221,21 +232,7 @@ where
             .await?;
         cached.extend(fetched);
         cached.sort_unstable_by_key(|(chunk_range, _)| chunk_range.start);
-
-        if cached.len() == 1 && cached[0].0 == range {
-            return Ok(cached.pop().expect("single chunk exists").1);
-        }
-
-        let mut reconstructed = BytesMut::with_capacity(range.len());
-        let mut cursor = range.start;
-        for (chunk_range, bytes) in cached {
-            assert_eq!(chunk_range.start, cursor, "read plan has no gaps");
-            assert_eq!(chunk_range.len(), bytes.len(), "chunk length is exact");
-            reconstructed.extend_from_slice(&bytes);
-            cursor = chunk_range.end;
-        }
-        assert_eq!(cursor, range.end, "read plan covers the request");
-        Ok(reconstructed.freeze())
+        Ok(reconstruct(range, cached))
     }
 
     async fn fetch_gap(
@@ -248,9 +245,9 @@ where
             start: range.start,
             end: range.end,
         });
-        let _request_guard = registration.entry.gate.lock().await;
+        let mut response = registration.entry.response.lock().await;
 
-        if let Some(bytes) = registration.entry.successful_response.lock().clone() {
+        if let Some(bytes) = response.clone() {
             return Ok((range, bytes));
         }
 
@@ -280,9 +277,22 @@ where
         let _ = self
             .cache
             .insert(key.clone(), range.clone(), bytes.clone())?;
-        *registration.entry.successful_response.lock() = Some(bytes.clone());
+        *response = Some(bytes.clone());
         Ok((range, bytes))
     }
+}
+
+fn reconstruct(range: Range<usize>, chunks: Vec<(Range<usize>, Bytes)>) -> Bytes {
+    let mut reconstructed = BytesMut::with_capacity(range.len());
+    let mut cursor = range.start;
+    for (chunk_range, bytes) in chunks {
+        assert_eq!(chunk_range.start, cursor, "read plan has no gaps");
+        assert_eq!(chunk_range.len(), bytes.len(), "chunk length is exact");
+        reconstructed.extend_from_slice(&bytes);
+        cursor = chunk_range.end;
+    }
+    assert_eq!(cursor, range.end, "read plan covers the request");
+    reconstructed.freeze()
 }
 
 #[async_trait]

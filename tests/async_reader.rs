@@ -165,6 +165,44 @@ async fn full_hits_skip_the_source_and_partial_hits_fetch_only_gaps() {
 }
 
 #[tokio::test]
+async fn one_gap_partial_reads_insert_the_fetched_chunk_in_order() {
+    let source = Arc::new(TestSource::new(b"abcdefghijklmnop"));
+    let cache = RangeCache::new(CacheCapacity::Unbounded);
+    cache
+        .insert(String::from("prefix"), 4..8, Bytes::from_static(b"efgh"))
+        .expect("valid insert");
+    cache
+        .insert(String::from("middle"), 0..2, Bytes::from_static(b"ab"))
+        .expect("valid insert");
+    cache
+        .insert(String::from("middle"), 6..8, Bytes::from_static(b"gh"))
+        .expect("valid insert");
+    let reader = reader(Arc::clone(&source), cache, 2);
+
+    assert_eq!(
+        reader
+            .read(&String::from("prefix"), 0..8)
+            .await
+            .expect("prefix gap read"),
+        Bytes::from_static(b"abcdefgh")
+    );
+    assert_eq!(
+        reader
+            .read(&String::from("middle"), 0..8)
+            .await
+            .expect("middle gap read"),
+        Bytes::from_static(b"abcdefgh")
+    );
+    assert_eq!(
+        source.calls(),
+        vec![
+            (String::from("prefix"), 0..4),
+            (String::from("middle"), 2..6),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn missing_gaps_obey_the_global_fetch_concurrency_limit() {
     let source = Arc::new(
         TestSource::new(b"abcdefghijklmnopqrstuvwxyz012345").with_delay(Duration::from_millis(30)),
