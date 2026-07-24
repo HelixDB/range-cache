@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Expanded Criterion microbenchmarks for cache operations, contention, and
+  async read-through behavior.
+- Complete core and async README examples plus documented benchmark results.
+
+### Changed
+
+- Raised the minimum supported Rust version from 1.85 to 1.86.
+- Updated canonical repository links after the project ownership transfer.
+
 ## [0.1.0] - 2026-07-21
 
 ### Added
@@ -17,5 +30,5 @@ project follows [Semantic Versioning](https://semver.org/).
 - Reference-model property tests, Criterion benchmarks, cross-platform CI, and
   coverage enforcement.
 
-[0.1.0]: https://github.com/HelixDB/range-cache/releases/tag/v0.1.0
-
+[Unreleased]: https://github.com/xav-db/range-cache/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/xav-db/range-cache/releases/tag/v0.1.0

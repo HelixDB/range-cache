@@ -2,12 +2,12 @@
 name = "range-cache"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 authors = ["HelixDB, Inc. <hello@helix-db.com>"]
-description = "A thread-safe sparse byte-range cache with optional async read-through"
+description = "Sparse byte-range caching and async read coalescing for immutable objects such as remote index files"
 license = "Apache-2.0"
-repository = "https://github.com/HelixDB/range-cache"
-homepage = "https://github.com/HelixDB/range-cache"
+repository = "https://github.com/xav-db/range-cache"
+homepage = "https://github.com/xav-db/range-cache"
 documentation = "https://docs.rs/range-cache"
 readme = "README.md"
 keywords = ["cache", "range", "bytes", "async", "storage"]
@@ -45,4 +45,3 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[bench]]
 name = "range_cache"
 harness = false
-
