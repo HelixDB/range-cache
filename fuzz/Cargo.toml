@@ -1,0 +1,23 @@
+[package]
+name = "range-cache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+range-cache = { path = ".." }
+
+[[bin]]
+name = "range_cache_state_machine"
+path = "fuzz_targets/range_cache_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -671,7 +671,7 @@ pub(crate) enum ReadPlan {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroUsize, sync::Arc};
+    use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
     use bytes::Bytes;
     use parking_lot::Mutex;
@@ -733,7 +733,7 @@ mod tests {
     #[should_panic(expected = "range cache LRU clock exhausted")]
     fn registering_after_lru_clock_exhaustion_panics() {
         let mut eviction = EvictionPolicy::Bounded {
-            lru: Default::default(),
+            lru: BTreeMap::default(),
             next_access: u64::MAX,
         };
         let _ = eviction.register(&"key", 0);
@@ -743,7 +743,7 @@ mod tests {
     fn absent_internal_ranges_are_noops() {
         let mut state = State::<&str>::new(CacheCapacity::Unbounded);
         let _ = state.take_block(&"missing", 0);
-        state.ranges.insert("empty", Default::default());
+        state.ranges.insert("empty", BTreeMap::default());
         let _ = state.take_block(&"empty", 0);
         let _ = state.remove(&"missing", 0);
         assert_eq!(state.resident_bytes, 0);

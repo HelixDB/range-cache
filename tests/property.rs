@@ -6,6 +6,8 @@ use range_cache::{CacheCapacity, InsertOutcome, Invalidation, RangeCache};
 
 const KEY_COUNT: usize = 3;
 const SOURCE_LENGTH: usize = 32;
+const BOUNDED_KEY_COUNT: usize = 3;
+const SLOT_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum Operation {
@@ -19,6 +21,7 @@ enum Operation {
 enum BoundedOperation {
     Insert,
     Get,
+    Missing,
     Invalidate,
     Clear,
 }
@@ -46,15 +49,18 @@ fn operation() -> impl Strategy<Value = (Operation, usize, usize, usize, u8)> {
     )
 }
 
-fn bounded_operation() -> impl Strategy<Value = (BoundedOperation, usize)> {
+fn bounded_operation() -> impl Strategy<Value = (BoundedOperation, usize, usize, usize)> {
     (
         prop_oneof![
             4 => Just(BoundedOperation::Insert),
             4 => Just(BoundedOperation::Get),
+            2 => Just(BoundedOperation::Missing),
             2 => Just(BoundedOperation::Invalidate),
             1 => Just(BoundedOperation::Clear),
         ],
-        0..5_usize,
+        0..BOUNDED_KEY_COUNT,
+        0..SLOT_COUNT,
+        0..SLOT_COUNT,
     )
 }
 
@@ -217,89 +223,144 @@ proptest! {
         let cache = RangeCache::new(CacheCapacity::Bounded(
             NonZeroUsize::new(8).expect("test capacity is non-zero"),
         ));
-        let mut access_by_key = [None; 5];
+        let mut access_by_range = [[None; SLOT_COUNT]; BOUNDED_KEY_COUNT];
         let mut next_access = 0_u64;
         let mut hits = 0_u64;
+        let mut partial_hits = 0_u64;
         let mut misses = 0_u64;
         let mut insertions = 0_u64;
         let mut evictions = 0_u64;
 
-        for (operation, key) in operations {
+        for (operation, key, first, second) in operations {
+            let first_slot = first.min(second);
+            let last_slot = first.max(second);
+            let range = first_slot * 4..last_slot * 4 + 2;
             match operation {
                 BoundedOperation::Insert => {
+                    let slot = first;
+                    let block_start = slot * 4;
+                    let payload = Bytes::from(vec![
+                        u8::try_from(key).expect("key fits in u8"),
+                        u8::try_from(slot).expect("slot fits in u8"),
+                    ]);
                     let outcome = cache
-                        .insert(
-                            key,
-                            0..4,
-                            Bytes::from(vec![u8::try_from(key).expect("key fits in u8"); 4]),
-                        )
+                        .insert(key, block_start..block_start + 2, payload)
                         .expect("valid insert");
-                    if access_by_key[key].is_some() {
+                    if access_by_range[key][slot].is_some() {
                         prop_assert_eq!(outcome, InsertOutcome::AlreadyCovered);
                     } else {
                         prop_assert_eq!(outcome, InsertOutcome::Inserted);
-                        access_by_key[key] = Some(next_access);
+                        access_by_range[key][slot] = Some(next_access);
                         next_access += 1;
                         insertions += 1;
 
-                        if access_by_key.iter().flatten().count() > 2 {
-                            let (oldest_key, _) = access_by_key
+                        if access_by_range.iter().flatten().flatten().count() > 4 {
+                            let (oldest_key, oldest_slot, _) = access_by_range
                                 .iter()
                                 .enumerate()
-                                .filter_map(|(key, access)| access.map(|access| (key, access)))
-                                .min_by_key(|(_, access)| *access)
+                                .flat_map(|(key, ranges)| {
+                                    ranges.iter().enumerate().filter_map(
+                                        move |(slot, access)| {
+                                            access.map(|access| (key, slot, access))
+                                        },
+                                    )
+                                })
+                                .min_by_key(|(_, _, access)| *access)
                                 .expect("an over-capacity model has an oldest entry");
-                            access_by_key[oldest_key] = None;
+                            access_by_range[oldest_key][oldest_slot] = None;
                             evictions += 1;
                         }
                     }
                 }
                 BoundedOperation::Get => {
-                    let expected = access_by_key[key]
-                        .is_some()
-                        .then(|| {
-                            Bytes::from(vec![u8::try_from(key).expect("key fits in u8"); 4])
-                        });
-                    prop_assert_eq!(cache.get(&key, 0..4).expect("valid range"), expected);
-                    if access_by_key[key].is_some() {
-                        access_by_key[key] = Some(next_access);
+                    let resident_slots = (first_slot..=last_slot)
+                        .filter(|&slot| access_by_range[key][slot].is_some())
+                        .collect::<Vec<_>>();
+                    let expected = (first_slot == last_slot
+                        && access_by_range[key][first_slot].is_some())
+                    .then(|| {
+                        Bytes::from(vec![
+                            u8::try_from(key).expect("key fits in u8"),
+                            u8::try_from(first_slot).expect("slot fits in u8"),
+                        ])
+                    });
+                    let is_hit = expected.is_some();
+                    prop_assert_eq!(cache.get(&key, range).expect("valid range"), expected);
+                    if is_hit {
+                        access_by_range[key][first_slot] = Some(next_access);
                         next_access += 1;
                         hits += 1;
-                    } else {
+                    } else if resident_slots.is_empty() {
                         misses += 1;
+                    } else {
+                        for slot in resident_slots {
+                            access_by_range[key][slot] = Some(next_access);
+                            next_access += 1;
+                        }
+                        partial_hits += 1;
                     }
                 }
-                BoundedOperation::Invalidate => {
-                    let expected = if access_by_key[key].take().is_some() {
-                        Invalidation {
-                            ranges: 1,
-                            bytes: 4,
+                BoundedOperation::Missing => {
+                    let mut expected = Vec::new();
+                    let mut cursor = range.start;
+                    for (slot, access) in access_by_range[key]
+                        .iter()
+                        .enumerate()
+                        .take(last_slot + 1)
+                        .skip(first_slot)
+                    {
+                        let start = slot * 4;
+                        if access.is_none() {
+                            continue;
                         }
-                    } else {
-                        Invalidation::default()
+                        if cursor < start {
+                            expected.push(cursor..start);
+                        }
+                        cursor = start + 2;
+                    }
+                    if cursor < range.end {
+                        expected.push(cursor..range.end);
+                    }
+                    prop_assert_eq!(
+                        cache.missing_ranges(&key, range).expect("valid range"),
+                        expected
+                    );
+                }
+                BoundedOperation::Invalidate => {
+                    let ranges = access_by_range[key].iter().flatten().count();
+                    let expected = Invalidation {
+                        ranges,
+                        bytes: ranges * 2,
                     };
                     prop_assert_eq!(cache.invalidate(&key), expected);
+                    access_by_range[key].fill(None);
                 }
                 BoundedOperation::Clear => {
-                    let ranges = access_by_key.iter().flatten().count();
+                    let ranges = access_by_range.iter().flatten().flatten().count();
                     prop_assert_eq!(
                         cache.clear(),
                         Invalidation {
                             ranges,
-                            bytes: ranges * 4,
+                            bytes: ranges * 2,
                         }
                     );
-                    access_by_key.fill(None);
+                    access_by_range.fill([None; SLOT_COUNT]);
                 }
             }
 
-            let ranges = access_by_key.iter().flatten().count();
+            let ranges = access_by_range.iter().flatten().flatten().count();
             let snapshot = cache.snapshot();
-            prop_assert_eq!(snapshot.resident_bytes, ranges * 4);
-            prop_assert_eq!(snapshot.keys, ranges);
+            prop_assert_eq!(snapshot.resident_bytes, ranges * 2);
+            prop_assert_eq!(
+                snapshot.keys,
+                access_by_range
+                    .iter()
+                    .filter(|ranges| ranges.iter().any(Option::is_some))
+                    .count()
+            );
             prop_assert_eq!(snapshot.ranges, ranges);
             prop_assert_eq!(snapshot.hits, hits);
-            prop_assert_eq!(snapshot.partial_hits, 0);
+            prop_assert_eq!(snapshot.partial_hits, partial_hits);
             prop_assert_eq!(snapshot.misses, misses);
             prop_assert_eq!(snapshot.insertions, insertions);
             prop_assert_eq!(snapshot.admissions_rejected_too_large, 0);

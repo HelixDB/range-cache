@@ -12,7 +12,7 @@ documentation = "https://docs.rs/range-cache"
 readme = "README.md"
 keywords = ["cache", "range", "bytes", "async", "storage"]
 categories = ["caching", "data-structures", "asynchronous"]
-exclude = [".github/"]
+exclude = [".github/", "fuzz/"]
 
 [features]
 default = []
