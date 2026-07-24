@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{collections::BTreeMap, num::NonZeroUsize, ops::Range};
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -21,6 +21,14 @@ enum BoundedOperation {
     Get,
     Invalidate,
     Clear,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SparseOperation {
+    Insert,
+    Get,
+    Missing,
+    Invalidate,
 }
 
 fn operation() -> impl Strategy<Value = (Operation, usize, usize, usize, u8)> {
@@ -47,6 +55,20 @@ fn bounded_operation() -> impl Strategy<Value = (BoundedOperation, usize)> {
             1 => Just(BoundedOperation::Clear),
         ],
         0..5_usize,
+    )
+}
+
+fn sparse_operation() -> impl Strategy<Value = (SparseOperation, usize, usize, u8)> {
+    (
+        prop_oneof![
+            4 => Just(SparseOperation::Insert),
+            2 => Just(SparseOperation::Get),
+            2 => Just(SparseOperation::Missing),
+            1 => Just(SparseOperation::Invalidate),
+        ],
+        0..1_000_000_usize,
+        1..65_usize,
+        any::<u8>(),
     )
 }
 
@@ -80,6 +102,35 @@ fn model_range_count(model: &[[Option<u8>; SOURCE_LENGTH]; KEY_COUNT]) -> usize 
                 .count()
         })
         .sum()
+}
+
+fn sparse_missing(model: &BTreeMap<usize, u8>, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut missing = Vec::new();
+    let mut cursor = range.start;
+    while cursor < range.end {
+        if model.contains_key(&cursor) {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < range.end && !model.contains_key(&cursor) {
+            cursor += 1;
+        }
+        missing.push(start..cursor);
+    }
+    missing
+}
+
+fn sparse_range_count(model: &BTreeMap<usize, u8>) -> usize {
+    model
+        .keys()
+        .scan(None, |previous, &offset| {
+            let starts_range = previous.is_none_or(|previous| previous + 1 != offset);
+            *previous = Some(offset);
+            Some(starts_range)
+        })
+        .filter(|starts_range| *starts_range)
+        .count()
 }
 
 proptest! {
@@ -253,6 +304,66 @@ proptest! {
             prop_assert_eq!(snapshot.insertions, insertions);
             prop_assert_eq!(snapshot.admissions_rejected_too_large, 0);
             prop_assert_eq!(snapshot.evictions, evictions);
+        }
+    }
+
+    #[test]
+    fn sparse_ranges_match_reference_coverage(
+        operations in prop::collection::vec(sparse_operation(), 1..100),
+    ) {
+        let cache = RangeCache::new(CacheCapacity::Unbounded);
+        let mut model = BTreeMap::new();
+
+        for (operation, start, length, value) in operations {
+            let end = start + length;
+            match operation {
+                SparseOperation::Insert => {
+                    let already_covered = (start..end).all(|offset| model.contains_key(&offset));
+                    let outcome = cache
+                        .insert((), start..end, Bytes::from(vec![value; length]))
+                        .expect("valid insert");
+                    prop_assert_eq!(
+                        outcome,
+                        if already_covered {
+                            InsertOutcome::AlreadyCovered
+                        } else {
+                            InsertOutcome::Inserted
+                        }
+                    );
+                    if !already_covered {
+                        model.extend((start..end).map(|offset| (offset, value)));
+                    }
+                }
+                SparseOperation::Get => {
+                    let expected = (start..end)
+                        .map(|offset| model.get(&offset).copied())
+                        .collect::<Option<Vec<_>>>()
+                        .map(Bytes::from);
+                    prop_assert_eq!(cache.get(&(), start..end).expect("valid range"), expected);
+                }
+                SparseOperation::Missing => {
+                    prop_assert_eq!(
+                        cache.missing_ranges(&(), start..end).expect("valid range"),
+                        sparse_missing(&model, start..end)
+                    );
+                }
+                SparseOperation::Invalidate => {
+                    let ranges = sparse_range_count(&model);
+                    prop_assert_eq!(
+                        cache.invalidate(&()),
+                        Invalidation {
+                            ranges,
+                            bytes: model.len(),
+                        }
+                    );
+                    model.clear();
+                }
+            }
+
+            let snapshot = cache.snapshot();
+            prop_assert_eq!(snapshot.resident_bytes, model.len());
+            prop_assert_eq!(snapshot.keys, usize::from(!model.is_empty()));
+            prop_assert_eq!(snapshot.ranges, sparse_range_count(&model));
         }
     }
 }

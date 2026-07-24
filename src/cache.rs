@@ -69,7 +69,7 @@ pub struct CacheSnapshot {
 struct CacheBlock {
     end: usize,
     bytes: Bytes,
-    last_access: Option<u64>,
+    last_access: u64,
 }
 
 #[derive(Default)]
@@ -88,6 +88,44 @@ enum EvictionPolicy<K> {
         lru: BTreeMap<u64, (K, usize)>,
         next_access: u64,
     },
+}
+
+impl<K> EvictionPolicy<K> {
+    fn take_access(&mut self) -> Option<u64> {
+        let Self::Bounded { next_access, .. } = self else {
+            return None;
+        };
+        let access = *next_access;
+        *next_access = next_access
+            .checked_add(1)
+            .expect("range cache LRU clock exhausted");
+        Some(access)
+    }
+}
+
+impl<K: Ord> EvictionPolicy<K> {
+    #[inline]
+    fn touch(&mut self, key: &K, start: usize, block: &mut CacheBlock) {
+        let Self::Bounded { lru, next_access } = self else {
+            return;
+        };
+        let previous = block.last_access;
+        let Some((resident_key, resident_start)) = lru.remove(&previous) else {
+            panic!("resident range must have an LRU entry");
+        };
+        debug_assert!(
+            &resident_key == key && resident_start == start,
+            "LRU entry must identify the resident range"
+        );
+
+        let access = *next_access;
+        *next_access = next_access
+            .checked_add(1)
+            .expect("range cache LRU clock exhausted");
+        block.last_access = access;
+        let replaced = lru.insert(access, (resident_key, resident_start));
+        debug_assert!(replaced.is_none(), "LRU access value is unique");
+    }
 }
 
 struct State<K> {
@@ -117,56 +155,19 @@ impl<K> State<K> {
 }
 
 impl<K: Ord + Clone> State<K> {
-    fn take_access(&mut self) -> Option<u64> {
-        let EvictionPolicy::Bounded { next_access, .. } = &mut self.eviction else {
-            return None;
-        };
-        let access = *next_access;
-        *next_access = next_access
-            .checked_add(1)
-            .expect("range cache LRU clock exhausted");
-        Some(access)
-    }
-
+    #[inline]
     fn touch(&mut self, key: &K, start: usize) {
         if matches!(self.eviction, EvictionPolicy::Unbounded) {
             return;
         }
-
-        let Some(previous) = self
-            .ranges
-            .get(key)
-            .and_then(|ranges| ranges.get(&start))
-            .and_then(|block| block.last_access)
-        else {
-            panic!("bounded resident range must have an access value");
-        };
-
-        let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
-            unreachable!("unbounded policy returned before touching recency");
-        };
-        let Some((resident_key, resident_start)) = lru.remove(&previous) else {
-            panic!("resident range must have an LRU entry");
-        };
-        assert!(
-            &resident_key == key && resident_start == start,
-            "LRU entry must identify the resident range"
-        );
-        let next = self
-            .take_access()
-            .expect("bounded cache provides access values");
-        self.ranges
+        let Self {
+            ranges, eviction, ..
+        } = self;
+        let block = ranges
             .get_mut(key)
             .and_then(|ranges| ranges.get_mut(&start))
-            .expect("touched range remains resident")
-            .last_access = Some(next);
-        let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
-            unreachable!("bounded policy remains bounded");
-        };
-        assert!(
-            lru.insert(next, (resident_key, start)).is_none(),
-            "LRU access value is unique"
-        );
+            .expect("touched range remains resident");
+        eviction.touch(key, start, block);
     }
 
     fn take_block(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
@@ -192,20 +193,14 @@ impl<K: Ord + Clone> State<K> {
 
     fn remove(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
         let block = self.take_block(key, start)?;
-        match (&mut self.eviction, block.last_access) {
-            (EvictionPolicy::Unbounded, None) => {}
-            (EvictionPolicy::Bounded { lru, .. }, Some(access)) => {
-                let Some((resident_key, resident_start)) = lru.remove(&access) else {
-                    panic!("removed range must have an LRU entry");
-                };
-                assert!(
-                    &resident_key == key && resident_start == start,
-                    "LRU entry must identify the removed range"
-                );
-            }
-            (EvictionPolicy::Unbounded, Some(_)) | (EvictionPolicy::Bounded { .. }, None) => {
-                panic!("range access metadata must match the eviction policy");
-            }
+        if let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction {
+            let Some((resident_key, resident_start)) = lru.remove(&block.last_access) else {
+                panic!("removed range must have an LRU entry");
+            };
+            assert!(
+                &resident_key == key && resident_start == start,
+                "LRU entry must identify the removed range"
+            );
         }
         Some(block)
     }
@@ -221,40 +216,10 @@ impl<K: Ord + Clone> State<K> {
             .take_block(&key, start)
             .expect("LRU range remains resident");
         assert_eq!(
-            block.last_access,
-            Some(access),
+            block.last_access, access,
             "evicted range access value matches its LRU entry"
         );
         block
-    }
-
-    fn covered(&self, key: &K, requested: &Range<usize>) -> Vec<(usize, Range<usize>)> {
-        let Some(ranges) = self.ranges.get(key) else {
-            return Vec::new();
-        };
-
-        let mut covered = Vec::new();
-        match ranges.range(..=requested.start).next_back() {
-            Some((&start, block)) if block.end > requested.start => {
-                covered.push((start, requested.start..block.end.min(requested.end)));
-            }
-            Some(_) | None => {}
-        }
-
-        covered.extend(
-            ranges
-                .range((
-                    Bound::Excluded(requested.start),
-                    Bound::Excluded(requested.end),
-                ))
-                .map(|(&start, block)| {
-                    (
-                        start,
-                        start.max(requested.start)..block.end.min(requested.end),
-                    )
-                }),
-        );
-        covered
     }
 }
 
@@ -318,21 +283,38 @@ impl<K: Ord + Clone> RangeCache<K> {
                     (start, block.bytes.slice(offset..offset + range.len()))
                 })
         });
-
         if let Some((start, bytes)) = hit {
             state.statistics.hits += 1;
             state.touch(key, start);
             return Ok(Some(bytes));
         }
 
-        let covered = state.covered(key, &range);
-        if covered.is_empty() {
-            state.statistics.misses += 1;
-        } else {
-            state.statistics.partial_hits += 1;
-            for (start, _) in covered {
-                state.touch(key, start);
+        let mut has_coverage = false;
+        {
+            let State {
+                ranges, eviction, ..
+            } = &mut *state;
+            if let Some(ranges) = ranges.get_mut(key) {
+                if let Some((&start, block)) = ranges
+                    .range_mut(..=range.start)
+                    .next_back()
+                    .filter(|(_, block)| block.end > range.start)
+                {
+                    has_coverage = true;
+                    eviction.touch(key, start, block);
+                }
+                for (&start, block) in
+                    ranges.range_mut((Bound::Excluded(range.start), Bound::Excluded(range.end)))
+                {
+                    has_coverage = true;
+                    eviction.touch(key, start, block);
+                }
             }
+        }
+        if has_coverage {
+            state.statistics.partial_hits += 1;
+        } else {
+            state.statistics.misses += 1;
         }
         Ok(None)
     }
@@ -353,8 +335,35 @@ impl<K: Ord + Clone> RangeCache<K> {
         }
 
         let state = self.inner.lock();
-        let covered = state.covered(key, &range);
-        Ok(missing_ranges(&range, &covered))
+        let Some(ranges) = state.ranges.get(key) else {
+            return Ok(vec![range]);
+        };
+
+        let mut missing = Vec::new();
+        let mut cursor = range.start;
+        if let Some((_, block)) = ranges
+            .range(..=range.start)
+            .next_back()
+            .filter(|(_, block)| block.end > range.start)
+        {
+            cursor = cursor.max(block.end.min(range.end));
+        }
+
+        for (&start, block) in
+            ranges.range((Bound::Excluded(range.start), Bound::Excluded(range.end)))
+        {
+            if cursor < start {
+                missing.push(cursor..start);
+            }
+            cursor = cursor.max(block.end.min(range.end));
+            if cursor == range.end {
+                break;
+            }
+        }
+        if cursor < range.end {
+            missing.push(cursor..range.end);
+        }
+        Ok(missing)
     }
 
     /// Inserts `bytes` for `range`, merging adjacent and overlapping ranges.
@@ -407,16 +416,22 @@ impl<K: Ord + Clone> RangeCache<K> {
         let mut merged_end = range.end;
         let mut affected = Vec::new();
         if let Some(ranges) = state.ranges.get(&key) {
-            for (&start, block) in ranges {
-                if block.end < merged_start {
-                    continue;
+            let following = match ranges.range(..=range.start).next_back() {
+                Some((&start, block)) if block.end >= range.start => {
+                    merged_start = start;
+                    merged_end = merged_end.max(block.end);
+                    affected.push((start, block.end));
+                    Bound::Excluded(start)
                 }
+                Some(_) | None => Bound::Included(range.start),
+            };
+
+            for (&start, block) in ranges.range((following, Bound::Unbounded)) {
                 if start > merged_end {
                     break;
                 }
-                merged_start = merged_start.min(start);
                 merged_end = merged_end.max(block.end);
-                affected.push((start, block.end, block.bytes.clone()));
+                affected.push((start, block.end));
             }
         }
 
@@ -434,7 +449,8 @@ impl<K: Ord + Clone> RangeCache<K> {
                 bytes
             } else {
                 let mut merged = vec![0; merged_length];
-                for (start, end, cached) in &affected {
+                for &(start, end) in &affected {
+                    let cached = &state.ranges[&key][&start].bytes;
                     let offset = start - merged_start;
                     merged[offset..offset + (end - start)].copy_from_slice(cached);
                 }
@@ -443,13 +459,13 @@ impl<K: Ord + Clone> RangeCache<K> {
                 Bytes::from(merged)
             };
 
-        for (start, _, _) in affected {
+        for (start, _) in affected {
             state
                 .remove(&key, start)
                 .expect("affected range remains resident");
         }
 
-        let access = state.take_access();
+        let access = state.eviction.take_access();
         if let Some(access) = access {
             let EvictionPolicy::Bounded { lru, .. } = &mut state.eviction else {
                 unreachable!("access values belong to bounded caches");
@@ -464,7 +480,7 @@ impl<K: Ord + Clone> RangeCache<K> {
             CacheBlock {
                 end: merged_end,
                 bytes: merged_bytes,
-                last_access: access,
+                last_access: access.unwrap_or_default(),
             },
         );
         assert!(previous.is_none(), "merged range start must be vacant");
@@ -567,31 +583,58 @@ impl<K: Ord + Clone> RangeCache<K> {
             return Ok(ReadPlan::Complete(bytes));
         }
 
-        let covered = state.covered(key, &range);
-        let missing = missing_ranges(&range, &covered);
-        let cached = covered
-            .iter()
-            .map(|(start, covered_range)| {
-                let block = state
-                    .ranges
-                    .get(key)
-                    .and_then(|ranges| ranges.get(start))
-                    .expect("covered range remains resident");
-                let offset = covered_range.start - start;
-                (
-                    covered_range.clone(),
-                    block.bytes.slice(offset..offset + covered_range.len()),
-                )
-            })
-            .collect();
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        let mut has_coverage = false;
+        let mut cursor = range.start;
+        {
+            let State {
+                ranges, eviction, ..
+            } = &mut *state;
+            if let Some(ranges) = ranges.get_mut(key) {
+                if let Some((&start, block)) = ranges
+                    .range_mut(..=range.start)
+                    .next_back()
+                    .filter(|(_, block)| block.end > range.start)
+                {
+                    let covered_end = block.end.min(range.end);
+                    let offset = range.start - start;
+                    cached.push((
+                        range.start..covered_end,
+                        block
+                            .bytes
+                            .slice(offset..offset + covered_end - range.start),
+                    ));
+                    has_coverage = true;
+                    cursor = cursor.max(covered_end);
+                    eviction.touch(key, start, block);
+                }
 
-        if covered.is_empty() {
-            state.statistics.misses += 1;
-        } else {
-            state.statistics.partial_hits += 1;
-            for (start, _) in covered {
-                state.touch(key, start);
+                for (&start, block) in
+                    ranges.range_mut((Bound::Excluded(range.start), Bound::Excluded(range.end)))
+                {
+                    if cursor < start {
+                        missing.push(cursor..start);
+                    }
+                    let covered_end = block.end.min(range.end);
+                    cached.push((start..covered_end, block.bytes.slice(..covered_end - start)));
+                    has_coverage = true;
+                    cursor = cursor.max(covered_end);
+                    eviction.touch(key, start, block);
+                    if cursor == range.end {
+                        break;
+                    }
+                }
             }
+        }
+        if cursor < range.end {
+            missing.push(cursor..range.end);
+        }
+
+        if has_coverage {
+            state.statistics.partial_hits += 1;
+        } else {
+            state.statistics.misses += 1;
         }
         Ok(ReadPlan::Fetch { cached, missing })
     }
@@ -605,24 +648,6 @@ fn validate_range(range: &Range<usize>) -> Result<(), RangeError> {
         });
     }
     Ok(())
-}
-
-fn missing_ranges(
-    requested: &Range<usize>,
-    covered: &[(usize, Range<usize>)],
-) -> Vec<Range<usize>> {
-    let mut missing = Vec::new();
-    let mut cursor = requested.start;
-    for (_, range) in covered {
-        if cursor < range.start {
-            missing.push(cursor..range.start);
-        }
-        cursor = cursor.max(range.end);
-    }
-    if cursor < requested.end {
-        missing.push(cursor..requested.end);
-    }
-    missing
 }
 
 #[cfg(feature = "async")]
