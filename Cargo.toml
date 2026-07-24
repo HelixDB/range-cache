@@ -2,7 +2,7 @@
 name = "range-cache"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 authors = ["HelixDB, Inc. <hello@helix-db.com>"]
 description = "A thread-safe sparse byte-range cache with optional async read-through"
 license = "Apache-2.0"
@@ -45,4 +45,3 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[bench]]
 name = "range_cache"
 harness = false
-
