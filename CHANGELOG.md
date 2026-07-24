@@ -11,6 +11,9 @@ project follows [Semantic Versioning](https://semver.org/).
 - Expanded Criterion microbenchmarks for cache operations, contention, and
   async read-through behavior.
 - Complete core and async README examples plus documented benchmark results.
+- Deterministic failure, cancellation, concurrency, and private-invariant tests.
+- A public-API state-machine fuzz target with checked-in edge-case corpora.
+- Source-normalized 100% coverage enforcement, nightly fuzzing, and weekly Miri.
 
 ### Changed
 

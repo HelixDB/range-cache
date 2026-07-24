@@ -1,0 +1,76 @@
+name: Robustness
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-pr:
+    name: Deterministic fuzz smoke
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned nightly
+        run: rustup toolchain install nightly-2026-02-17 --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Run 10,000 state-machine cases
+        run: >-
+          cargo +nightly-2026-02-17 fuzz run range_cache_state_machine
+          fuzz/corpus/range_cache_state_machine --
+          -runs=10000 -seed=0 -timeout=5 -max_len=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: range-cache-fuzz-pr-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  fuzz-nightly:
+    name: 15-minute nightly fuzz
+    if: github.event_name == 'schedule' && github.event.schedule == '30 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned nightly
+        run: rustup toolchain install nightly-2026-02-17 --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz for 15 minutes
+        run: >-
+          cargo +nightly-2026-02-17 fuzz run range_cache_state_machine
+          fuzz/corpus/range_cache_state_machine --
+          -max_total_time=900 -seed=0 -timeout=5 -max_len=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: range-cache-fuzz-nightly-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  miri-weekly:
+    name: Weekly core Miri
+    if: github.event_name == 'schedule' && github.event.schedule == '0 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned nightly and Miri
+        run: >-
+          rustup toolchain install nightly-2026-02-17
+          --profile minimal --component miri,rust-src
+      - name: Run core and private-invariant tests
+        run: >-
+          cargo +nightly-2026-02-17 miri test
+          --no-default-features --lib --test core
