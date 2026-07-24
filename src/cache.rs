@@ -85,21 +85,39 @@ struct Statistics {
 enum EvictionPolicy<K> {
     Unbounded,
     Bounded {
-        lru: BTreeMap<u64, (K, usize)>,
+        // Entries are boxed once, then moved between access keys without
+        // moving a potentially large K through B-tree nodes on every touch.
+        lru: BTreeMap<u64, Box<LruEntry<K>>>,
         next_access: u64,
     },
 }
 
-impl<K> EvictionPolicy<K> {
-    fn take_access(&mut self) -> Option<u64> {
-        let Self::Bounded { next_access, .. } = self else {
-            return None;
+struct LruEntry<K> {
+    key: K,
+    start: usize,
+}
+
+impl<K: Clone> EvictionPolicy<K> {
+    fn register(&mut self, key: &K, start: usize) -> u64 {
+        let Self::Bounded { lru, next_access } = self else {
+            return 0;
         };
         let access = *next_access;
         *next_access = next_access
             .checked_add(1)
             .expect("range cache LRU clock exhausted");
-        Some(access)
+        assert!(
+            lru.insert(
+                access,
+                Box::new(LruEntry {
+                    key: key.clone(),
+                    start,
+                }),
+            )
+            .is_none(),
+            "new range has a unique LRU entry"
+        );
+        access
     }
 }
 
@@ -110,11 +128,11 @@ impl<K: Ord> EvictionPolicy<K> {
             return;
         };
         let previous = block.last_access;
-        let Some((resident_key, resident_start)) = lru.remove(&previous) else {
+        let Some(resident) = lru.remove(&previous) else {
             panic!("resident range must have an LRU entry");
         };
         debug_assert!(
-            &resident_key == key && resident_start == start,
+            &resident.key == key && resident.start == start,
             "LRU entry must identify the resident range"
         );
 
@@ -123,7 +141,7 @@ impl<K: Ord> EvictionPolicy<K> {
             .checked_add(1)
             .expect("range cache LRU clock exhausted");
         block.last_access = access;
-        let replaced = lru.insert(access, (resident_key, resident_start));
+        let replaced = lru.insert(access, resident);
         debug_assert!(replaced.is_none(), "LRU access value is unique");
     }
 }
@@ -194,11 +212,11 @@ impl<K: Ord + Clone> State<K> {
     fn remove(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
         let block = self.take_block(key, start)?;
         if let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction {
-            let Some((resident_key, resident_start)) = lru.remove(&block.last_access) else {
+            let Some(resident) = lru.remove(&block.last_access) else {
                 panic!("removed range must have an LRU entry");
             };
             assert!(
-                &resident_key == key && resident_start == start,
+                &resident.key == key && resident.start == start,
                 "LRU entry must identify the removed range"
             );
         }
@@ -209,9 +227,10 @@ impl<K: Ord + Clone> State<K> {
         let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
             panic!("only bounded caches evict");
         };
-        let Some((access, (key, start))) = lru.pop_first() else {
+        let Some((access, resident)) = lru.pop_first() else {
             panic!("resident bytes require an LRU entry");
         };
+        let LruEntry { key, start } = *resident;
         let block = self
             .take_block(&key, start)
             .expect("LRU range remains resident");
@@ -465,22 +484,13 @@ impl<K: Ord + Clone> RangeCache<K> {
                 .expect("affected range remains resident");
         }
 
-        let access = state.eviction.take_access();
-        if let Some(access) = access {
-            let EvictionPolicy::Bounded { lru, .. } = &mut state.eviction else {
-                unreachable!("access values belong to bounded caches");
-            };
-            assert!(
-                lru.insert(access, (key.clone(), merged_start)).is_none(),
-                "new range has a unique LRU entry"
-            );
-        }
+        let access = state.eviction.register(&key, merged_start);
         let previous = state.ranges.entry(key).or_default().insert(
             merged_start,
             CacheBlock {
                 end: merged_end,
                 bytes: merged_bytes,
-                last_access: access.unwrap_or_default(),
+                last_access: access,
             },
         );
         assert!(previous.is_none(), "merged range start must be vacant");

@@ -1,4 +1,7 @@
-use std::num::NonZeroUsize;
+use std::{
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use bytes::Bytes;
 use range_cache::{CacheCapacity, InsertOutcome, Invalidation, RangeCache, RangeError};
@@ -7,6 +10,18 @@ fn bounded(bytes: usize) -> RangeCache<&'static str> {
     RangeCache::new(CacheCapacity::Bounded(
         NonZeroUsize::new(bytes).expect("test capacity is non-zero"),
     ))
+}
+
+static KEY_CLONES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CountedKey(u8);
+
+impl Clone for CountedKey {
+    fn clone(&self) -> Self {
+        KEY_CLONES.fetch_add(1, Ordering::Relaxed);
+        Self(self.0)
+    }
 }
 
 #[test]
@@ -276,6 +291,24 @@ fn bounded_cache_never_exceeds_capacity_and_reads_update_lru() {
     assert_eq!(snapshot.resident_bytes, 8);
     assert_eq!(snapshot.ranges, 2);
     assert_eq!(snapshot.evictions, 1);
+}
+
+#[test]
+fn bounded_hits_reuse_the_resident_lru_key() {
+    let cache = RangeCache::new(CacheCapacity::Bounded(
+        NonZeroUsize::new(8).expect("test capacity is non-zero"),
+    ));
+    let key = CountedKey(1);
+    cache
+        .insert(key.clone(), 0..4, Bytes::from_static(b"data"))
+        .expect("valid insert");
+    KEY_CLONES.store(0, Ordering::Relaxed);
+
+    assert_eq!(
+        cache.get(&key, 0..4).expect("valid range"),
+        Some(Bytes::from_static(b"data"))
+    );
+    assert_eq!(KEY_CLONES.load(Ordering::Relaxed), 0);
 }
 
 #[test]
