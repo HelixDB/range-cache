@@ -1,7 +1,7 @@
 //! Core cache types.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroUsize,
     ops::{Bound, Range},
     sync::Arc,
@@ -69,7 +69,7 @@ pub struct CacheSnapshot {
 struct CacheBlock {
     end: usize,
     bytes: Bytes,
-    last_access: u64,
+    last_access: Option<u64>,
 }
 
 #[derive(Default)]
@@ -82,63 +82,94 @@ struct Statistics {
     evictions: u64,
 }
 
+enum EvictionPolicy<K> {
+    Unbounded,
+    Bounded {
+        lru: BTreeMap<u64, (K, usize)>,
+        next_access: u64,
+    },
+}
+
 struct State<K> {
     ranges: BTreeMap<K, BTreeMap<usize, CacheBlock>>,
-    lru: BTreeSet<(u64, K, usize)>,
+    eviction: EvictionPolicy<K>,
     resident_bytes: usize,
-    next_access: u64,
+    resident_ranges: usize,
     statistics: Statistics,
 }
 
-impl<K> Default for State<K> {
-    fn default() -> Self {
+impl<K> State<K> {
+    fn new(capacity: CacheCapacity) -> Self {
         Self {
             ranges: BTreeMap::new(),
-            lru: BTreeSet::new(),
+            eviction: match capacity {
+                CacheCapacity::Bounded(_) => EvictionPolicy::Bounded {
+                    lru: BTreeMap::new(),
+                    next_access: 0,
+                },
+                CacheCapacity::Unbounded => EvictionPolicy::Unbounded,
+            },
             resident_bytes: 0,
-            next_access: 0,
+            resident_ranges: 0,
             statistics: Statistics::default(),
         }
     }
 }
 
 impl<K: Ord + Clone> State<K> {
-    fn take_access(&mut self) -> u64 {
-        let access = self.next_access;
-        self.next_access = self
-            .next_access
+    fn take_access(&mut self) -> Option<u64> {
+        let EvictionPolicy::Bounded { next_access, .. } = &mut self.eviction else {
+            return None;
+        };
+        let access = *next_access;
+        *next_access = next_access
             .checked_add(1)
             .expect("range cache LRU clock exhausted");
-        access
+        Some(access)
     }
 
     fn touch(&mut self, key: &K, start: usize) {
+        if matches!(self.eviction, EvictionPolicy::Unbounded) {
+            return;
+        }
+
         let Some(previous) = self
             .ranges
             .get(key)
             .and_then(|ranges| ranges.get(&start))
-            .map(|block| block.last_access)
+            .and_then(|block| block.last_access)
         else {
-            return;
+            panic!("bounded resident range must have an access value");
         };
 
+        let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
+            unreachable!("unbounded policy returned before touching recency");
+        };
+        let Some((resident_key, resident_start)) = lru.remove(&previous) else {
+            panic!("resident range must have an LRU entry");
+        };
         assert!(
-            self.lru.remove(&(previous, key.clone(), start)),
-            "resident range must have an LRU entry"
+            &resident_key == key && resident_start == start,
+            "LRU entry must identify the resident range"
         );
-        let next = self.take_access();
+        let next = self
+            .take_access()
+            .expect("bounded cache provides access values");
         self.ranges
             .get_mut(key)
             .and_then(|ranges| ranges.get_mut(&start))
             .expect("touched range remains resident")
-            .last_access = next;
+            .last_access = Some(next);
+        let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
+            unreachable!("bounded policy remains bounded");
+        };
         assert!(
-            self.lru.insert((next, key.clone(), start)),
+            lru.insert(next, (resident_key, start)).is_none(),
             "LRU access value is unique"
         );
     }
 
-    fn remove(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
+    fn take_block(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
         let (block, key_is_empty) = {
             let ranges = self.ranges.get_mut(key)?;
             let block = ranges.remove(&start)?;
@@ -148,15 +179,53 @@ impl<K: Ord + Clone> State<K> {
         if key_is_empty {
             self.ranges.remove(key);
         }
-        assert!(
-            self.lru.remove(&(block.last_access, key.clone(), start)),
-            "removed range must have an LRU entry"
-        );
         self.resident_bytes = self
             .resident_bytes
             .checked_sub(block.bytes.len())
             .expect("resident byte accounting cannot underflow");
+        self.resident_ranges = self
+            .resident_ranges
+            .checked_sub(1)
+            .expect("resident range accounting cannot underflow");
         Some(block)
+    }
+
+    fn remove(&mut self, key: &K, start: usize) -> Option<CacheBlock> {
+        let block = self.take_block(key, start)?;
+        match (&mut self.eviction, block.last_access) {
+            (EvictionPolicy::Unbounded, None) => {}
+            (EvictionPolicy::Bounded { lru, .. }, Some(access)) => {
+                let Some((resident_key, resident_start)) = lru.remove(&access) else {
+                    panic!("removed range must have an LRU entry");
+                };
+                assert!(
+                    &resident_key == key && resident_start == start,
+                    "LRU entry must identify the removed range"
+                );
+            }
+            (EvictionPolicy::Unbounded, Some(_)) | (EvictionPolicy::Bounded { .. }, None) => {
+                panic!("range access metadata must match the eviction policy");
+            }
+        }
+        Some(block)
+    }
+
+    fn evict_oldest(&mut self) -> CacheBlock {
+        let EvictionPolicy::Bounded { lru, .. } = &mut self.eviction else {
+            panic!("only bounded caches evict");
+        };
+        let Some((access, (key, start))) = lru.pop_first() else {
+            panic!("resident bytes require an LRU entry");
+        };
+        let block = self
+            .take_block(&key, start)
+            .expect("LRU range remains resident");
+        assert_eq!(
+            block.last_access,
+            Some(access),
+            "evicted range access value matches its LRU entry"
+        );
+        block
     }
 
     fn covered(&self, key: &K, requested: &Range<usize>) -> Vec<(usize, Range<usize>)> {
@@ -209,7 +278,7 @@ impl<K> RangeCache<K> {
     #[must_use]
     pub fn new(capacity: CacheCapacity) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(State::default())),
+            inner: Arc::new(Mutex::new(State::new(capacity))),
             capacity,
         }
     }
@@ -381,10 +450,15 @@ impl<K: Ord + Clone> RangeCache<K> {
         }
 
         let access = state.take_access();
-        assert!(
-            state.lru.insert((access, key.clone(), merged_start)),
-            "new range has a unique LRU entry"
-        );
+        if let Some(access) = access {
+            let EvictionPolicy::Bounded { lru, .. } = &mut state.eviction else {
+                unreachable!("access values belong to bounded caches");
+            };
+            assert!(
+                lru.insert(access, (key.clone(), merged_start)).is_none(),
+                "new range has a unique LRU entry"
+            );
+        }
         let previous = state.ranges.entry(key).or_default().insert(
             merged_start,
             CacheBlock {
@@ -395,18 +469,12 @@ impl<K: Ord + Clone> RangeCache<K> {
         );
         assert!(previous.is_none(), "merged range start must be vacant");
         state.resident_bytes += merged_length;
+        state.resident_ranges += 1;
         state.statistics.insertions += 1;
 
         if let CacheCapacity::Bounded(capacity) = self.capacity {
             while state.resident_bytes > capacity.get() {
-                let (_, oldest_key, oldest_start) = state
-                    .lru
-                    .first()
-                    .cloned()
-                    .expect("resident bytes require an LRU entry");
-                state
-                    .remove(&oldest_key, oldest_start)
-                    .expect("LRU range remains resident");
+                let _ = state.evict_oldest();
                 state.statistics.evictions += 1;
             }
         }
@@ -444,12 +512,15 @@ impl<K: Ord + Clone> RangeCache<K> {
     pub fn clear(&self) -> Invalidation {
         let mut state = self.inner.lock();
         let invalidation = Invalidation {
-            ranges: state.lru.len(),
+            ranges: state.resident_ranges,
             bytes: state.resident_bytes,
         };
         state.ranges.clear();
-        state.lru.clear();
+        if let EvictionPolicy::Bounded { lru, .. } = &mut state.eviction {
+            lru.clear();
+        }
         state.resident_bytes = 0;
+        state.resident_ranges = 0;
         invalidation
     }
 
@@ -461,7 +532,7 @@ impl<K: Ord + Clone> RangeCache<K> {
             capacity: self.capacity,
             resident_bytes: state.resident_bytes,
             keys: state.ranges.len(),
-            ranges: state.lru.len(),
+            ranges: state.resident_ranges,
             hits: state.statistics.hits,
             partial_hits: state.statistics.partial_hits,
             misses: state.statistics.misses,

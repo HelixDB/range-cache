@@ -1,6 +1,8 @@
+use std::num::NonZeroUsize;
+
 use bytes::Bytes;
 use proptest::prelude::*;
-use range_cache::{CacheCapacity, InsertOutcome, RangeCache};
+use range_cache::{CacheCapacity, InsertOutcome, Invalidation, RangeCache};
 
 const KEY_COUNT: usize = 3;
 const SOURCE_LENGTH: usize = 32;
@@ -11,6 +13,14 @@ enum Operation {
     Get,
     Missing,
     Invalidate,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BoundedOperation {
+    Insert,
+    Get,
+    Invalidate,
+    Clear,
 }
 
 fn operation() -> impl Strategy<Value = (Operation, usize, usize, usize, u8)> {
@@ -25,6 +35,18 @@ fn operation() -> impl Strategy<Value = (Operation, usize, usize, usize, u8)> {
         0..=SOURCE_LENGTH,
         0..=SOURCE_LENGTH,
         any::<u8>(),
+    )
+}
+
+fn bounded_operation() -> impl Strategy<Value = (BoundedOperation, usize)> {
+    (
+        prop_oneof![
+            4 => Just(BoundedOperation::Insert),
+            4 => Just(BoundedOperation::Get),
+            2 => Just(BoundedOperation::Invalidate),
+            1 => Just(BoundedOperation::Clear),
+        ],
+        0..5_usize,
     )
 }
 
@@ -134,6 +156,103 @@ proptest! {
                 model.iter().filter(|bytes| bytes.iter().any(Option::is_some)).count()
             );
             prop_assert_eq!(snapshot.ranges, model_range_count(&model));
+        }
+    }
+
+    #[test]
+    fn bounded_cache_matches_reference_lru(
+        operations in prop::collection::vec(bounded_operation(), 1..200),
+    ) {
+        let cache = RangeCache::new(CacheCapacity::Bounded(
+            NonZeroUsize::new(8).expect("test capacity is non-zero"),
+        ));
+        let mut access_by_key = [None; 5];
+        let mut next_access = 0_u64;
+        let mut hits = 0_u64;
+        let mut misses = 0_u64;
+        let mut insertions = 0_u64;
+        let mut evictions = 0_u64;
+
+        for (operation, key) in operations {
+            match operation {
+                BoundedOperation::Insert => {
+                    let outcome = cache
+                        .insert(
+                            key,
+                            0..4,
+                            Bytes::from(vec![u8::try_from(key).expect("key fits in u8"); 4]),
+                        )
+                        .expect("valid insert");
+                    if access_by_key[key].is_some() {
+                        prop_assert_eq!(outcome, InsertOutcome::AlreadyCovered);
+                    } else {
+                        prop_assert_eq!(outcome, InsertOutcome::Inserted);
+                        access_by_key[key] = Some(next_access);
+                        next_access += 1;
+                        insertions += 1;
+
+                        if access_by_key.iter().flatten().count() > 2 {
+                            let (oldest_key, _) = access_by_key
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(key, access)| access.map(|access| (key, access)))
+                                .min_by_key(|(_, access)| *access)
+                                .expect("an over-capacity model has an oldest entry");
+                            access_by_key[oldest_key] = None;
+                            evictions += 1;
+                        }
+                    }
+                }
+                BoundedOperation::Get => {
+                    let expected = access_by_key[key]
+                        .is_some()
+                        .then(|| {
+                            Bytes::from(vec![u8::try_from(key).expect("key fits in u8"); 4])
+                        });
+                    prop_assert_eq!(cache.get(&key, 0..4).expect("valid range"), expected);
+                    if access_by_key[key].is_some() {
+                        access_by_key[key] = Some(next_access);
+                        next_access += 1;
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                    }
+                }
+                BoundedOperation::Invalidate => {
+                    let expected = if access_by_key[key].take().is_some() {
+                        Invalidation {
+                            ranges: 1,
+                            bytes: 4,
+                        }
+                    } else {
+                        Invalidation::default()
+                    };
+                    prop_assert_eq!(cache.invalidate(&key), expected);
+                }
+                BoundedOperation::Clear => {
+                    let ranges = access_by_key.iter().flatten().count();
+                    prop_assert_eq!(
+                        cache.clear(),
+                        Invalidation {
+                            ranges,
+                            bytes: ranges * 4,
+                        }
+                    );
+                    access_by_key.fill(None);
+                }
+            }
+
+            let ranges = access_by_key.iter().flatten().count();
+            let snapshot = cache.snapshot();
+            prop_assert_eq!(snapshot.resident_bytes, ranges * 4);
+            prop_assert_eq!(snapshot.keys, ranges);
+            prop_assert_eq!(snapshot.ranges, ranges);
+            prop_assert_eq!(snapshot.hits, hits);
+            prop_assert_eq!(snapshot.partial_hits, 0);
+            prop_assert_eq!(snapshot.misses, misses);
+            prop_assert_eq!(snapshot.insertions, insertions);
+            prop_assert_eq!(snapshot.admissions_rejected_too_large, 0);
+            prop_assert_eq!(snapshot.evictions, evictions);
         }
     }
 }
