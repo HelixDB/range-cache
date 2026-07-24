@@ -144,20 +144,24 @@ latency is reported instead of apparent byte throughput because the returned
 
 | Operation | Workload | Median estimate |
 | --- | --- | ---: |
-| Full hit | 32 KiB requested from a 64 KiB cached range | 19.89 ns |
-| Gap calculation | 64 resident ranges | 498.41 ns |
-| Overlapping insertion | Merge across 64 resident ranges | 3.16 µs |
-| Eviction | Insert with 64 resident ranges at capacity | 288.34 ns |
-| Concurrent hit | 8 workers sharing one key | 73.21 ns/read |
-| Warm read-through | 4 KiB cached read | 85.80 ns |
-| Fragmented reconstruction | 64 alternating cached/missing segments | 18.00 µs |
-| Coalesced read-through | 32 identical concurrent readers | 11.17 µs |
+| Unbounded full hit | 32 KiB requested from a 64 KiB cached range | 10.04 ns |
+| Bounded full hit | 32 KiB requested from a 64 KiB cached range | 18.15 ns |
+| Gap calculation | 64 resident ranges | 237.17 ns |
+| Overlapping insertion | Merge across 64 resident ranges | 2.27 µs |
+| Sparse end insertion | 512 resident ranges | 90.25 ns |
+| Eviction | Insert with 64 resident ranges at capacity | 180.85 ns |
+| Concurrent hit | 8 workers sharing one unbounded key | 47.87 ns/read |
+| Cold read-through | One 4 KiB missing range | 282.98 ns |
+| Partial read-through | One 2 KiB gap in a 4 KiB read | 840.30 ns |
+| Warm read-through | 4 KiB cached read | 76.89 ns |
+| Fragmented reconstruction | 64 alternating cached/missing segments | 13.80 µs |
+| Coalesced read-through | 32 identical concurrent readers | 4.77 µs |
 
 The coalesced 32-reader case performs one 4 KiB source read; issuing those reads
 directly would perform 32 calls and fetch 128 KiB.
 
 Measured with `cargo bench --all-features --bench range_cache -- --noplot` on
-commit `4e9e7baa61ede11bf70b0d246954f3187c1328d8` using `rustc 1.97.1` on macOS
+commit `115e1f98d9b0c258f5fcd4efeeaab2c165de00e4` using `rustc 1.97.1` on macOS
 26.5, an Apple M4 Pro (14 cores), and 24 GiB of memory. These numbers describe
 that machine and revision; they are not cross-platform performance guarantees.
 

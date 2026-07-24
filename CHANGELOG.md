@@ -16,6 +16,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - Raised the minimum supported Rust version from 1.85 to 1.86.
 - Updated canonical repository links after the project ownership transfer.
+- Removed recency bookkeeping from unbounded caches and made bounded touches
+  reuse stable access-keyed LRU entries.
+- Bounded sparse insertion and read planning to relevant ordered ranges.
+- Added direct one-gap async reads and consolidated in-flight response locking.
 
 ## [0.1.0] - 2026-07-21
 
