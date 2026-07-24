@@ -1,6 +1,10 @@
 use std::{
     num::NonZeroUsize,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
 };
 
 use bytes::Bytes;
@@ -37,6 +41,16 @@ fn cache_is_cloneable_send_and_sync() {
     assert_eq!(
         clone.get(&"key", 0..4).expect("valid range"),
         Some(Bytes::from_static(b"abcd"))
+    );
+}
+
+#[test]
+fn capacity_reports_the_configured_policy() {
+    let bounded = CacheCapacity::Bounded(NonZeroUsize::new(8).expect("test capacity is non-zero"));
+    assert_eq!(RangeCache::<u8>::new(bounded).capacity(), bounded);
+    assert_eq!(
+        RangeCache::<u8>::new(CacheCapacity::Unbounded).capacity(),
+        CacheCapacity::Unbounded
     );
 }
 
@@ -89,6 +103,44 @@ fn reversed_ranges_and_payload_mismatches_are_errors() {
             expected: 0,
             actual: 1,
         })
+    );
+    assert_eq!(
+        cache.insert("key", std::ops::Range { start: 5, end: 4 }, Bytes::new()),
+        Err(RangeError::ReversedRange { start: 5, end: 4 })
+    );
+    assert_eq!(
+        cache.insert("key", 2..5, Bytes::from_static(b"long")),
+        Err(RangeError::PayloadLengthMismatch {
+            range: 2..5,
+            expected: 3,
+            actual: 4,
+        })
+    );
+    assert_eq!(
+        RangeError::ReversedRange { start: 5, end: 4 }.to_string(),
+        "reversed byte range 5..4"
+    );
+}
+
+#[test]
+fn ranges_near_usize_max_remain_valid() {
+    let cache = RangeCache::new(CacheCapacity::Unbounded);
+    let start = usize::MAX - 8;
+    cache
+        .insert("key", start..usize::MAX, Bytes::from_static(b"abcdefgh"))
+        .expect("valid high-offset insert");
+
+    assert_eq!(
+        cache
+            .get(&"key", start + 2..usize::MAX - 2)
+            .expect("valid high-offset read"),
+        Some(Bytes::from_static(b"cdef"))
+    );
+    assert_eq!(
+        cache
+            .missing_ranges(&"key", start - 2..usize::MAX)
+            .expect("valid high-offset range"),
+        vec![start - 2..start]
     );
 }
 
@@ -291,6 +343,95 @@ fn bounded_cache_never_exceeds_capacity_and_reads_update_lru() {
     assert_eq!(snapshot.resident_bytes, 8);
     assert_eq!(snapshot.ranges, 2);
     assert_eq!(snapshot.evictions, 1);
+}
+
+#[test]
+fn bounded_partial_hits_touch_each_covered_range() {
+    let cache = bounded(8);
+    cache
+        .insert("first", 0..2, Bytes::from_static(b"ab"))
+        .expect("valid insert");
+    cache
+        .insert("first", 4..6, Bytes::from_static(b"ef"))
+        .expect("valid insert");
+    cache
+        .insert("oldest", 0..4, Bytes::from_static(b"wxyz"))
+        .expect("valid insert");
+
+    assert_eq!(cache.get(&"first", 0..6).expect("valid range"), None);
+    cache
+        .insert("new", 0..2, Bytes::from_static(b"12"))
+        .expect("valid insert");
+
+    assert_eq!(cache.get(&"oldest", 0..4).expect("valid range"), None);
+    assert_eq!(
+        cache.get(&"first", 0..2).expect("valid range"),
+        Some(Bytes::from_static(b"ab"))
+    );
+    assert_eq!(
+        cache.get(&"first", 4..6).expect("valid range"),
+        Some(Bytes::from_static(b"ef"))
+    );
+}
+
+#[test]
+fn merged_range_is_newer_than_ranges_it_replaces() {
+    let cache = bounded(8);
+    cache
+        .insert("oldest", 0..4, Bytes::from_static(b"wxyz"))
+        .expect("valid insert");
+    cache
+        .insert("merged", 0..2, Bytes::from_static(b"ab"))
+        .expect("valid insert");
+    cache
+        .insert("merged", 4..6, Bytes::from_static(b"ef"))
+        .expect("valid insert");
+    cache
+        .insert("merged", 2..4, Bytes::from_static(b"cd"))
+        .expect("valid insert");
+
+    assert_eq!(cache.get(&"oldest", 0..4).expect("valid range"), None);
+    assert_eq!(
+        cache.get(&"merged", 0..6).expect("valid range"),
+        Some(Bytes::from_static(b"abcdef"))
+    );
+    let snapshot = cache.snapshot();
+    assert_eq!(snapshot.resident_bytes, 6);
+    assert_eq!(snapshot.ranges, 1);
+    assert_eq!(snapshot.evictions, 1);
+}
+
+#[test]
+fn concurrent_hits_preserve_bytes_and_exact_counters() {
+    let cache = Arc::new(RangeCache::new(CacheCapacity::Unbounded));
+    cache
+        .insert("key", 0..8, Bytes::from_static(b"abcdefgh"))
+        .expect("valid insert");
+    let workers = if cfg!(miri) { 2 } else { 8 };
+    let iterations = if cfg!(miri) { 8 } else { 1_000 };
+    let ready = Arc::new(Barrier::new(workers + 1));
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let cache = Arc::clone(&cache);
+            let ready = Arc::clone(&ready);
+            scope.spawn(move || {
+                ready.wait();
+                for _ in 0..iterations {
+                    assert_eq!(
+                        cache.get(&"key", 0..8).expect("valid range"),
+                        Some(Bytes::from_static(b"abcdefgh"))
+                    );
+                }
+            });
+        }
+        ready.wait();
+    });
+
+    let snapshot = cache.snapshot();
+    assert_eq!(snapshot.hits, u64::try_from(workers * iterations).unwrap());
+    assert_eq!(snapshot.resident_bytes, 8);
+    assert_eq!(snapshot.ranges, 1);
 }
 
 #[test]

@@ -276,7 +276,8 @@ where
 
         let _ = self
             .cache
-            .insert(key.clone(), range.clone(), bytes.clone())?;
+            .insert(key.clone(), range.clone(), bytes.clone())
+            .expect("validated source bytes match the requested range");
         *response = Some(bytes.clone());
         Ok((range, bytes))
     }
@@ -310,49 +311,80 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, num::NonZeroUsize, sync::Arc, time::Duration};
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use tokio::sync::Semaphore;
 
-    use super::{CachedReader, RangeReader, ReaderConfig};
+    use super::{CachedReader, RangeReader, ReadError, ReaderConfig};
     use crate::{CacheCapacity, RangeCache};
 
-    struct BlockingSource {
+    #[derive(Clone, Copy, Debug, thiserror::Error)]
+    #[error("controlled source failure")]
+    struct TestError;
+
+    struct ControlledSource {
         started: Semaphore,
+        release: Semaphore,
+        calls: AtomicUsize,
+        fail: bool,
     }
 
     #[async_trait]
-    impl RangeReader<String> for BlockingSource {
-        type Error = Infallible;
+    impl RangeReader<String> for ControlledSource {
+        type Error = TestError;
 
         async fn read_range(
             &self,
             _key: &String,
             range: std::ops::Range<usize>,
         ) -> Result<Bytes, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.add_permits(1);
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            self.release
+                .acquire()
+                .await
+                .expect("source release semaphore remains open")
+                .forget();
+            if self.fail {
+                return Err(TestError);
+            }
             Ok(Bytes::from(vec![0; range.len()]))
         }
     }
 
+    fn source(fail: bool) -> Arc<ControlledSource> {
+        Arc::new(ControlledSource {
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+            calls: AtomicUsize::new(0),
+            fail,
+        })
+    }
+
+    async fn read_key(
+        reader: CachedReader<String, ControlledSource>,
+    ) -> Result<Bytes, ReadError<TestError>> {
+        reader.read(&String::from("key"), 0..4).await
+    }
+
     #[tokio::test]
     async fn cancelled_leader_removes_its_in_flight_registration() {
-        let source = Arc::new(BlockingSource {
-            started: Semaphore::new(0),
-        });
+        let source = source(false);
         let reader = CachedReader::new(
             Arc::clone(&source),
             RangeCache::new(CacheCapacity::Unbounded),
             ReaderConfig::new(NonZeroUsize::new(1).expect("non-zero")),
         );
         let task_reader = reader.clone();
-        let task = tokio::spawn(async move {
-            let key = String::from("key");
-            task_reader.read(&key, 0..4).await
-        });
+        let task = tokio::spawn(read_key(task_reader));
         source
             .started
             .acquire()
@@ -363,6 +395,106 @@ mod tests {
         assert!(task.await.expect_err("task was cancelled").is_cancelled());
 
         tokio::task::yield_now().await;
+        assert!(reader.in_flight.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_requests_remove_their_in_flight_registration() {
+        let source = source(false);
+        let reader = CachedReader::new(
+            Arc::clone(&source),
+            RangeCache::new(CacheCapacity::Unbounded),
+            ReaderConfig::new(NonZeroUsize::new(1).expect("non-zero")),
+        );
+        let task_reader = reader.clone();
+        let task = tokio::spawn(read_key(task_reader));
+        source
+            .started
+            .acquire()
+            .await
+            .expect("source semaphore remains open")
+            .forget();
+        source.release.add_permits(1);
+        assert_eq!(
+            task.await
+                .expect("task completed")
+                .expect("source read succeeds"),
+            Bytes::from_static(&[0; 4])
+        );
+        assert!(reader.in_flight.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_requests_remove_their_in_flight_registration() {
+        let source = source(true);
+        let reader = CachedReader::new(
+            Arc::clone(&source),
+            RangeCache::new(CacheCapacity::Unbounded),
+            ReaderConfig::new(NonZeroUsize::new(1).expect("non-zero")),
+        );
+        let task_reader = reader.clone();
+        let task = tokio::spawn(read_key(task_reader));
+        source
+            .started
+            .acquire()
+            .await
+            .expect("source semaphore remains open")
+            .forget();
+        source.release.add_permits(1);
+        assert_eq!(
+            task.await
+                .expect("task completed")
+                .expect_err("source read fails")
+                .to_string(),
+            "range source failed: controlled source failure"
+        );
+        assert!(reader.in_flight.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_gap_rechecks_the_cache_before_reading_the_source() {
+        let source = source(false);
+        let cache = RangeCache::new(CacheCapacity::Unbounded);
+        let key = String::from("key");
+        cache
+            .insert(key.clone(), 0..4, Bytes::from_static(b"data"))
+            .expect("valid insert");
+        let reader = CachedReader::new(
+            Arc::clone(&source),
+            cache,
+            ReaderConfig::new(NonZeroUsize::new(1).expect("non-zero")),
+        );
+
+        assert_eq!(
+            reader
+                .fetch_gap(&key, 0..4)
+                .await
+                .expect("cached gap succeeds"),
+            (0..4, Bytes::from_static(b"data"))
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+        assert!(reader.in_flight.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_gap_propagates_range_validation_errors() {
+        let source = source(false);
+        let reader = CachedReader::new(
+            Arc::clone(&source),
+            RangeCache::new(CacheCapacity::Unbounded),
+            ReaderConfig::new(NonZeroUsize::new(1).expect("non-zero")),
+        );
+        let reversed = std::ops::Range { start: 4, end: 3 };
+
+        assert_eq!(
+            reader
+                .fetch_gap(&String::from("key"), reversed)
+                .await
+                .expect_err("reversed range fails")
+                .to_string(),
+            "reversed byte range 4..3"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
         assert!(reader.in_flight.entries.lock().is_empty());
     }
 }

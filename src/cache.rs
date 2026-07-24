@@ -668,3 +668,119 @@ pub(crate) enum ReadPlan {
         missing: Vec<Range<usize>>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, sync::Arc};
+
+    use bytes::Bytes;
+    use parking_lot::Mutex;
+
+    use super::{CacheBlock, CacheCapacity, EvictionPolicy, RangeCache, State};
+
+    fn bounded_state() -> State<&'static str> {
+        State::new(CacheCapacity::Bounded(
+            NonZeroUsize::new(8).expect("test capacity is non-zero"),
+        ))
+    }
+
+    fn add_untracked_block(state: &mut State<&'static str>) {
+        state.ranges.entry("key").or_default().insert(
+            0,
+            CacheBlock {
+                end: 1,
+                bytes: Bytes::from_static(b"x"),
+                last_access: 0,
+            },
+        );
+        state.resident_bytes = 1;
+        state.resident_ranges = 1;
+    }
+
+    #[test]
+    #[should_panic(expected = "resident range must have an LRU entry")]
+    fn touching_an_untracked_bounded_range_panics() {
+        let mut state = bounded_state();
+        add_untracked_block(&mut state);
+        state.touch(&"key", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "removed range must have an LRU entry")]
+    fn removing_an_untracked_bounded_range_panics() {
+        let mut state = bounded_state();
+        add_untracked_block(&mut state);
+        let _ = state.remove(&"key", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "only bounded caches evict")]
+    fn unbounded_state_cannot_evict() {
+        let mut state = State::<u8>::new(CacheCapacity::Unbounded);
+        let _ = state.evict_oldest();
+    }
+
+    #[test]
+    #[should_panic(expected = "resident bytes require an LRU entry")]
+    fn empty_bounded_state_cannot_evict() {
+        let mut state = State::<u8>::new(CacheCapacity::Bounded(
+            NonZeroUsize::new(1).expect("test capacity is non-zero"),
+        ));
+        let _ = state.evict_oldest();
+    }
+
+    #[test]
+    #[should_panic(expected = "range cache LRU clock exhausted")]
+    fn registering_after_lru_clock_exhaustion_panics() {
+        let mut eviction = EvictionPolicy::Bounded {
+            lru: Default::default(),
+            next_access: u64::MAX,
+        };
+        let _ = eviction.register(&"key", 0);
+    }
+
+    #[test]
+    fn absent_internal_ranges_are_noops() {
+        let mut state = State::<&str>::new(CacheCapacity::Unbounded);
+        let _ = state.take_block(&"missing", 0);
+        state.ranges.insert("empty", Default::default());
+        let _ = state.take_block(&"empty", 0);
+        let _ = state.remove(&"missing", 0);
+        assert_eq!(state.resident_bytes, 0);
+        assert_eq!(state.resident_ranges, 0);
+    }
+
+    #[test]
+    fn overlapping_internal_ranges_do_not_create_negative_gaps() {
+        let mut state = State::new(CacheCapacity::Unbounded);
+        state.ranges.entry("key").or_default().insert(
+            0,
+            CacheBlock {
+                end: 4,
+                bytes: Bytes::from_static(b"abcd"),
+                last_access: 0,
+            },
+        );
+        state.ranges.entry("key").or_default().insert(
+            2,
+            CacheBlock {
+                end: 6,
+                bytes: Bytes::from_static(b"cdef"),
+                last_access: 0,
+            },
+        );
+        state.resident_bytes = 8;
+        state.resident_ranges = 2;
+        let cache = RangeCache {
+            inner: Arc::new(Mutex::new(state)),
+            capacity: CacheCapacity::Unbounded,
+        };
+
+        assert_eq!(
+            cache.missing_ranges(&"key", 0..6).expect("valid range"),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        #[cfg(feature = "async")]
+        let _ = cache.read_plan(&"key", 0..6).expect("valid read plan");
+    }
+}
