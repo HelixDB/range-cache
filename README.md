@@ -92,19 +92,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         convert::Infallible,
         num::NonZeroUsize,
         ops::Range,
-        sync::{Arc, Mutex},
+        sync::Arc,
     };
 
     use bytes::Bytes;
     use range_cache::{CacheCapacity, CachedReader, RangeCache, RangeReader, ReaderConfig};
 
-    struct ObjectStore {
-        data: Bytes,
-        fetched: Mutex<Vec<Range<usize>>>,
-    }
+    struct MemorySource(Bytes);
 
     #[async_trait::async_trait]
-    impl RangeReader<String> for ObjectStore {
+    impl RangeReader<String> for MemorySource {
         type Error = Infallible;
 
         async fn read_range(
@@ -112,41 +109,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _key: &String,
             range: Range<usize>,
         ) -> Result<Bytes, Self::Error> {
-            self.fetched
-                .lock()
-                .expect("fetch log lock is not poisoned")
-                .push(range.clone());
-            Ok(self.data.slice(range))
+            Ok(self.0.slice(range))
         }
     }
 
-    let source = Arc::new(ObjectStore {
-        data: Bytes::from_static(b"abcdefghijklmnop"),
-        fetched: Mutex::new(Vec::new()),
-    });
+    let cache = RangeCache::new(CacheCapacity::Bounded(
+        NonZeroUsize::new(1024).expect("capacity is non-zero"),
+    ));
+    let source = Arc::new(MemorySource(Bytes::from_static(b"abcdefghijklmnop")));
     let reader = CachedReader::new(
-        Arc::clone(&source),
-        RangeCache::new(CacheCapacity::Bounded(
-            NonZeroUsize::new(1024).expect("capacity is non-zero"),
-        )),
+        source,
+        cache,
         ReaderConfig::new(NonZeroUsize::new(4).expect("concurrency is non-zero")),
     );
     let key = String::from("s3://bucket/index");
 
     assert_eq!(
-        reader.read(&key, 0..8).await?,
-        Bytes::from_static(b"abcdefgh"),
-    );
-    assert_eq!(
         reader.read(&key, 4..12).await?,
         Bytes::from_static(b"efghijkl"),
-    );
-    assert_eq!(
-        *source
-            .fetched
-            .lock()
-            .expect("fetch log lock is not poisoned"),
-        vec![0..8, 8..12],
     );
     Ok(())
 }
@@ -164,20 +144,24 @@ latency is reported instead of apparent byte throughput because the returned
 
 | Operation | Workload | Median estimate |
 | --- | --- | ---: |
-| Full hit | 32 KiB requested from a 64 KiB cached range | 19.89 ns |
-| Gap calculation | 64 resident ranges | 498.41 ns |
-| Overlapping insertion | Merge across 64 resident ranges | 3.16 µs |
-| Eviction | Insert with 64 resident ranges at capacity | 288.34 ns |
-| Concurrent hit | 8 workers sharing one key | 73.21 ns/read |
-| Warm read-through | 4 KiB cached read | 85.80 ns |
-| Fragmented reconstruction | 64 alternating cached/missing segments | 18.00 µs |
-| Coalesced read-through | 32 identical concurrent readers | 11.17 µs |
+| Unbounded full hit | 32 KiB requested from a 64 KiB cached range | 10.04 ns |
+| Bounded full hit | 32 KiB requested from a 64 KiB cached range | 18.15 ns |
+| Gap calculation | 64 resident ranges | 237.17 ns |
+| Overlapping insertion | Merge across 64 resident ranges | 2.27 µs |
+| Sparse end insertion | 512 resident ranges | 90.25 ns |
+| Eviction | Insert with 64 resident ranges at capacity | 180.85 ns |
+| Concurrent hit | 8 workers sharing one unbounded key | 47.87 ns/read |
+| Cold read-through | One 4 KiB missing range | 282.98 ns |
+| Partial read-through | One 2 KiB gap in a 4 KiB read | 840.30 ns |
+| Warm read-through | 4 KiB cached read | 76.89 ns |
+| Fragmented reconstruction | 64 alternating cached/missing segments | 13.80 µs |
+| Coalesced read-through | 32 identical concurrent readers | 4.77 µs |
 
 The coalesced 32-reader case performs one 4 KiB source read; issuing those reads
 directly would perform 32 calls and fetch 128 KiB.
 
 Measured with `cargo bench --all-features --bench range_cache -- --noplot` on
-commit `4e9e7baa61ede11bf70b0d246954f3187c1328d8` using `rustc 1.97.1` on macOS
+commit `115e1f98d9b0c258f5fcd4efeeaab2c165de00e4` using `rustc 1.97.1` on macOS
 26.5, an Apple M4 Pro (14 cores), and 24 GiB of memory. These numbers describe
 that machine and revision; they are not cross-platform performance guarantees.
 

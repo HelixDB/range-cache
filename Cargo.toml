@@ -1,6 +1,6 @@
 [package]
 name = "range-cache"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.86"
 authors = ["HelixDB, Inc. <hello@helix-db.com>"]
@@ -12,7 +12,7 @@ documentation = "https://docs.rs/range-cache"
 readme = "README.md"
 keywords = ["cache", "range", "bytes", "async", "storage"]
 categories = ["caching", "data-structures", "asynchronous"]
-exclude = [".github/"]
+exclude = [".github/", "fuzz/"]
 
 [features]
 default = []

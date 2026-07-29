@@ -56,7 +56,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
       - run: rustup override set stable
       - run: cargo install cargo-llvm-cov --locked
-      - run: cargo llvm-cov --all-features --workspace --fail-under-lines 95
+      - run: cargo llvm-cov --all-features --workspace --json --output-path target/coverage.json
+      - run: node scripts/check-source-coverage.mjs target/coverage.json
 
   package:
     name: Package

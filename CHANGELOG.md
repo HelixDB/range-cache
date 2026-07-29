@@ -6,16 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-29
+
 ### Added
 
 - Expanded Criterion microbenchmarks for cache operations, contention, and
   async read-through behavior.
 - Complete core and async README examples plus documented benchmark results.
+- Deterministic failure, cancellation, concurrency, and private-invariant tests.
+- A public-API state-machine fuzz target with checked-in edge-case corpora.
+- Source-normalized 100% coverage enforcement, nightly fuzzing, and weekly Miri.
 
 ### Changed
 
 - Raised the minimum supported Rust version from 1.85 to 1.86.
 - Updated canonical repository links after the project ownership transfer.
+- Removed recency bookkeeping from unbounded caches and made bounded touches
+  reuse stable access-keyed LRU entries.
+- Bounded sparse insertion and read planning to relevant ordered ranges.
+- Added direct one-gap async reads and consolidated in-flight response locking.
 
 ## [0.1.0] - 2026-07-21
 
@@ -30,5 +39,6 @@ project follows [Semantic Versioning](https://semver.org/).
 - Reference-model property tests, Criterion benchmarks, cross-platform CI, and
   coverage enforcement.
 
-[Unreleased]: https://github.com/xav-db/range-cache/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/xav-db/range-cache/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/xav-db/range-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xav-db/range-cache/releases/tag/v0.1.0

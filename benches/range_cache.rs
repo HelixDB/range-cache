@@ -13,14 +13,20 @@ use range_cache::{CacheCapacity, RangeCache};
 fn full_hits(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("full_hit");
     for size in [1_024, 65_536, 1_048_576] {
-        let cache = RangeCache::new(CacheCapacity::Unbounded);
-        cache
-            .insert(0_u8, 0..size, Bytes::from(vec![1; size]))
-            .expect("benchmark insert");
-        group.bench_with_input(
-            BenchmarkId::new("cached_bytes", size),
-            &size,
-            |bencher, &size| {
+        for (policy, capacity) in [
+            ("unbounded_cached_bytes", CacheCapacity::Unbounded),
+            (
+                "bounded_cached_bytes",
+                CacheCapacity::Bounded(
+                    NonZeroUsize::new(size).expect("benchmark capacity is non-zero"),
+                ),
+            ),
+        ] {
+            let cache = RangeCache::new(capacity);
+            cache
+                .insert(0_u8, 0..size, Bytes::from(vec![1; size]))
+                .expect("benchmark insert");
+            group.bench_with_input(BenchmarkId::new(policy, size), &size, |bencher, &size| {
                 bencher.iter(|| {
                     black_box(
                         cache
@@ -28,8 +34,8 @@ fn full_hits(criterion: &mut Criterion) {
                             .expect("benchmark range"),
                     )
                 });
-            },
-        );
+            });
+        }
     }
     group.finish();
 }
@@ -161,6 +167,59 @@ fn insertion(criterion: &mut Criterion) {
     overlap_group.finish();
 }
 
+fn sparse_insertion(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("sparse_insertion");
+    for ranges in [8, 64, 512] {
+        group.bench_with_input(
+            BenchmarkId::new("beginning_resident_ranges", ranges),
+            &ranges,
+            |bencher, &ranges| {
+                bencher.iter_batched_ref(
+                    || {
+                        (
+                            fragmented_cache_from(ranges, 32),
+                            Some(Bytes::from_static(&[2; 16])),
+                        )
+                    },
+                    |(cache, payload)| {
+                        let Some(payload) = payload.take() else {
+                            panic!("benchmark payload is available");
+                        };
+                        black_box(
+                            cache
+                                .insert(0_u8, 0..16, payload)
+                                .expect("benchmark insertion"),
+                        )
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("end_resident_ranges", ranges),
+            &ranges,
+            |bencher, &ranges| {
+                let start = ranges * 32;
+                bencher.iter_batched_ref(
+                    || (fragmented_cache(ranges), Some(Bytes::from_static(&[2; 16]))),
+                    |(cache, payload)| {
+                        let Some(payload) = payload.take() else {
+                            panic!("benchmark payload is available");
+                        };
+                        black_box(
+                            cache
+                                .insert(0_u8, start..start + 16, payload)
+                                .expect("benchmark insertion"),
+                        )
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 fn eviction(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("eviction");
     for ranges in [8, 64, 512] {
@@ -199,39 +258,53 @@ fn concurrent_hits(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("concurrent_hit");
     group.throughput(Throughput::Elements(1));
     for workers in [1, 2, 4, 8] {
-        let cache = RangeCache::new(CacheCapacity::Unbounded);
-        for key in 0..workers {
-            cache
-                .insert(key, 0..4_096, Bytes::from(vec![1; 4_096]))
-                .expect("benchmark insert");
-        }
+        for (policy, capacity) in [
+            ("unbounded", CacheCapacity::Unbounded),
+            (
+                "bounded",
+                CacheCapacity::Bounded(
+                    NonZeroUsize::new(workers * 4_096).expect("benchmark capacity is non-zero"),
+                ),
+            ),
+        ] {
+            let cache = RangeCache::new(capacity);
+            for key in 0..workers {
+                cache
+                    .insert(key, 0..4_096, Bytes::from(vec![1; 4_096]))
+                    .expect("benchmark insert");
+            }
 
-        group.bench_with_input(
-            BenchmarkId::new("shared_key_workers", workers),
-            &workers,
-            |bencher, &workers| {
-                bencher.iter_custom(|iterations| {
-                    concurrent_hit_duration(&cache, workers, iterations, true)
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("independent_key_workers", workers),
-            &workers,
-            |bencher, &workers| {
-                bencher.iter_custom(|iterations| {
-                    concurrent_hit_duration(&cache, workers, iterations, false)
-                });
-            },
-        );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{policy}_shared_key_workers"), workers),
+                &workers,
+                |bencher, &workers| {
+                    bencher.iter_custom(|iterations| {
+                        concurrent_hit_duration(&cache, workers, iterations, true)
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{policy}_independent_key_workers"), workers),
+                &workers,
+                |bencher, &workers| {
+                    bencher.iter_custom(|iterations| {
+                        concurrent_hit_duration(&cache, workers, iterations, false)
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }
 
 fn fragmented_cache(ranges: usize) -> RangeCache<u8> {
+    fragmented_cache_from(ranges, 0)
+}
+
+fn fragmented_cache_from(ranges: usize, offset: usize) -> RangeCache<u8> {
     let cache = RangeCache::new(CacheCapacity::Unbounded);
     for range in 0..ranges {
-        let start = range * 32;
+        let start = offset + range * 32;
         cache
             .insert(0, start..start + 16, Bytes::from_static(&[1; 16]))
             .expect("benchmark insert");
@@ -420,6 +493,25 @@ mod asynchronous {
                 BatchSize::SmallInput,
             );
         });
+        group.bench_function("partial_single_gap_4096_bytes", |bencher| {
+            bencher.iter_batched_ref(
+                || {
+                    let cache = RangeCache::new(CacheCapacity::Unbounded);
+                    cache
+                        .insert(0, 0..2_048, data.slice(0..2_048))
+                        .expect("benchmark insert");
+                    reader(Arc::new(Source::immediate(data.clone())), cache, 1)
+                },
+                |reader| {
+                    black_box(
+                        runtime
+                            .block_on(reader.read(&0, 0..4_096))
+                            .expect("benchmark partial read"),
+                    )
+                },
+                BatchSize::SmallInput,
+            );
+        });
         group.bench_function("warm_4096_bytes", |bencher| {
             bencher.iter(|| {
                 black_box(
@@ -536,6 +628,7 @@ criterion_group!(
     misses,
     gap_calculation,
     insertion,
+    sparse_insertion,
     eviction,
     concurrent_hits,
     async_benchmarks
