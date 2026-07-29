@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-29
+
 ### Added
 
 - Expanded Criterion microbenchmarks for cache operations, contention, and
@@ -37,5 +39,6 @@ project follows [Semantic Versioning](https://semver.org/).
 - Reference-model property tests, Criterion benchmarks, cross-platform CI, and
   coverage enforcement.
 
-[Unreleased]: https://github.com/xav-db/range-cache/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/xav-db/range-cache/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/xav-db/range-cache/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xav-db/range-cache/releases/tag/v0.1.0
